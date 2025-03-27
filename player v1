@@ -6,84 +6,105 @@ import os
 import pickle
 from sklearn.neighbors import BallTree
 
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-
-class AutonomousPlayer(Player):
+class SemiAutonomousPlayer(Player):
     def __init__(self):
-        super(AutonomousPlayer, self).__init__()
+        super(SemiAutonomousPlayer, self).__init__()
         self.fpv = None
         self.screen = None
         self.goal = None
         self.tree = None
         self.path = []
         self.current_step = 0
+        self.auto_mode = True  # Enables semi-auto mode
         self.database = None
         self.save_dir = "data/images_subsample/"
 
-        # Load precomputed VLAD descriptors if available
         if os.path.exists("VLAD_database.pkl"):
             self.database = pickle.load(open("VLAD_database.pkl", "rb"))
             self.tree = BallTree(self.database, leaf_size=50)
 
-    def pre_navigation(self):
-        super(AutonomousPlayer, self).pre_navigation()
-        self.load_or_compute_vlad()
+    def reset(self):
+        """Reset the player's state."""
+        self.fpv = None
+        self.screen = None
+        self.goal = None
+        self.path = []
+        self.current_step = 0
+        self.auto_mode = True  # Reset to auto mode
+        print("Player reset complete.")
 
-    def load_or_compute_vlad(self):
-        """ Load or compute VLAD descriptors """
-        if self.database is None:
-            print("VLAD database not found. Exploration required.")
-            self.database = []
-            for img_name in sorted(os.listdir(self.save_dir)):
-                img = cv2.imread(os.path.join(self.save_dir, img_name))
-                vlad_feature = self.compute_vlad(img)
-                self.database.append(vlad_feature)
-            pickle.dump(self.database, open("VLAD_database.pkl", "wb"))
-            self.tree = BallTree(self.database, leaf_size=50)
-
-    def compute_vlad(self, img):
-        """ Compute a dummy VLAD descriptor """
-        return np.random.rand(128)  # Placeholder until dataset is available
+    def toggle_auto_mode(self):
+        """Toggle between manual and auto mode."""
+        self.auto_mode = not self.auto_mode
+        print(f"Auto Mode: {'Enabled' if self.auto_mode else 'Disabled'}")
 
     def act(self):
-        """ Automatically decide movement """
-        if not self.path:
-            return Action.IDLE
+        """Automatically move forward if in auto mode; otherwise, listen to key inputs."""
+        if self.auto_mode:
+            if self.fpv is None:  # If no first-person view data, stay idle
+                print("Waiting for FPV data...")
+                return Action.IDLE
+            return Action.FORWARD
 
-        if self.current_step < len(self.path) - 1:
-            next_index = self.path[self.current_step + 1]
-            self.current_step += 1
-            return self.determine_movement(self.path[self.current_step - 1], next_index)
-        else:
-            return Action.CHECKIN
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return Action.QUIT
 
-    def determine_movement(self, current, next_node):
-        """ Basic movement decision logic """
-        return Action.FORWARD
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_a:
+                    self.toggle_auto_mode()
+                elif event.key == pygame.K_SPACE:
+                    return Action.CHECKIN
+                elif event.key == pygame.K_LEFT:
+                    return Action.LEFT
+                elif event.key == pygame.K_RIGHT:
+                    return Action.RIGHT
+                elif event.key == pygame.K_UP:
+                    return Action.FORWARD
+                elif event.key == pygame.K_DOWN:
+                    return Action.BACKWARD
+        return Action.IDLE
 
     def see(self, fpv):
-        """ Process first-person view and plan movement """
+        """Process first-person view and plan movement."""
+        if fpv is None or len(fpv.shape) < 3:
+            print("No FPV data received. Skipping frame...")
+            return
         self.fpv = fpv
-        if self.goal is None:
-            targets = self.get_target_images()
-            if targets:
-                self.goal = self.get_neighbor(targets[0])
-                print(f'Goal ID: {self.goal}')
-                self.find_path()
+
+        if self.screen is None:
+            h, w, _ = fpv.shape
+            self.screen = pygame.display.set_mode((w, h))
+
+        pygame.display.set_caption("SemiAutonomousPlayer:fpv")
+        rgb = cv2.cvtColor(fpv, cv2.COLOR_BGR2RGB)
+        pygame_img = pygame.image.frombuffer(rgb.tobytes(), (w, h), 'RGB')
+        self.screen.blit(pygame_img, (0, 0))
+        pygame.display.update()
 
     def get_neighbor(self, img):
-        """ Find the closest matching image """
-        q_vlad = self.compute_vlad(img).reshape(1, -1)
+        """Find the closest matching image."""
+        q_vlad = np.array(self.compute_vlad(img))
+        if q_vlad.size == 0:  # Prevent empty queries
+            print("Warning: VLAD feature is empty. Using fallback index 0.")
+            return 0
+        q_vlad = q_vlad.reshape(1, -1)
         _, index = self.tree.query(q_vlad, 1)
         return index[0][0]
 
-    def find_path(self):
-        """ Plan a simple movement path """
-        start_index = self.get_neighbor(self.fpv)
-        self.path = [start_index, self.goal]
-        self.current_step = 0
+    def compute_vlad(self, img):
+        """Compute VLAD descriptor with a fallback for empty results."""
+        vlad = np.random.rand(128)  # Placeholder until dataset is available
+        if vlad is None or vlad.size == 0:
+            print("Warning: VLAD descriptor is empty. Using a zero vector.")
+            vlad = np.zeros((1, 128))  # Ensure correct shape
+        return vlad.flatten()
 
 if __name__ == "__main__":
-    import vis_nav_game
-    vis_nav_game.play(the_player=AutonomousPlayer())
+    import logging
+    logging.basicConfig(filename='vis_nav_player.log', filemode='w', level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s: %(message)s', datefmt='%d-%b-%y %H:%M:%S')
+    import vis_nav_game as vng
+    logging.info(f'player.py is using vis_nav_game {vng.core.__version__}')
+    vng.play(the_player=SemiAutonomousPlayer())
