@@ -1,0 +1,129 @@
+from vis_nav_game import Player, Action, Phase
+import pygame
+import cv2
+import numpy as np
+import os
+import pickle
+from sklearn.cluster import KMeans
+from sklearn.neighbors import BallTree
+from tqdm import tqdm
+from natsort import natsorted
+import networkx as nx
+from scipy.spatial import distance
+import joblib
+
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+class AutonomousPlayer(Player):
+    def __init__(self):
+        super(AutonomousPlayer, self).__init__()
+        self.fpv = None
+        self.screen = None
+        self.goal = None
+        self.tree = None
+        self.G = None
+        self.path = []
+        self.current_step = 0
+
+        # Load data
+        self.save_dir = "data/images_subsample/"
+        self.sift = cv2.SIFT_create()
+        self.sift_descriptors, self.codebook, self.database = None, None, None
+        if os.path.exists("sift_descriptors.npy"):
+            self.sift_descriptors = np.load("sift_descriptors.npy")
+        if os.path.exists("codebook.pkl"):
+            self.codebook = pickle.load(open("codebook.pkl", "rb"))
+        if os.path.exists("VLAD_database.pkl"):
+            self.database = pickle.load(open("VLAD_database.pkl", "rb"))
+        if os.path.exists("knn_graph.pkl"):
+            self.G = pickle.load(open("knn_graph.pkl", "rb"))
+
+    def pre_navigation(self):
+        super(AutonomousPlayer, self).pre_navigation()
+        self.pre_nav_compute()
+
+    def pre_nav_compute(self):
+        """ Build BallTree and optimize graph """
+        if self.database is None:
+            print("Computing VLAD embeddings...")
+            self.database = [self.get_VLAD(cv2.imread(os.path.join(self.save_dir, img))) 
+                             for img in tqdm(natsorted(os.listdir(self.save_dir)), desc="Processing images")]
+            pickle.dump(self.database, open("VLAD_database.pkl", "wb"))
+        
+        if self.G is None:
+            print("Building Graph...")
+            self.G = nx.Graph()
+            for i in range(len(self.database)):
+                self.G.add_node(i)
+            
+            for i in tqdm(range(len(self.database)), desc="Computing edges"):
+                distances = [(j, distance.euclidean(self.database[i], self.database[j])) for j in range(len(self.database)) if i != j]
+                neighbors = sorted(distances, key=lambda x: x[1])[:8]  # Dynamically selecting closest neighbors
+                for neighbor, dist in neighbors:
+                    self.G.add_edge(i, neighbor, weight=dist)
+            pickle.dump(self.G, open("knn_graph.pkl", "wb"))
+        
+        self.tree = BallTree(self.database, leaf_size=50)
+
+    def get_VLAD(self, img):
+        """ Compute VLAD descriptor """
+        _, des = self.sift.detectAndCompute(img, None)
+        if des is None:
+            return np.zeros((self.codebook.n_clusters, des.shape[1])).flatten()
+        pred_labels = self.codebook.predict(des)
+        VLAD_feature = np.zeros((self.codebook.n_clusters, des.shape[1]))
+        for i in range(self.codebook.n_clusters):
+            if np.sum(pred_labels == i) > 0:
+                VLAD_feature[i] = np.sum(des[pred_labels == i, :] - self.codebook.cluster_centers_[i], axis=0)
+        VLAD_feature = VLAD_feature.flatten()
+        return VLAD_feature / np.linalg.norm(VLAD_feature)
+    
+    def act(self):
+        """ Automatically move towards the goal using A* path """
+        if not self.path:
+            return Action.IDLE
+        
+        if self.current_step < len(self.path) - 1:
+            next_index = self.path[self.current_step + 1]
+            self.current_step += 1
+            return self.determine_movement(self.path[self.current_step - 1], next_index)
+        else:
+            return Action.CHECKIN
+    
+    def determine_movement(self, current, next_node):
+        """ Determine movement direction """
+        neighbors = list(self.G.neighbors(current))
+        if next_node in neighbors:
+            return Action.FORWARD
+        else:
+            return Action.RIGHT if np.random.rand() > 0.5 else Action.LEFT
+    
+    def see(self, fpv):
+        """ Process first-person view """
+        self.fpv = fpv
+        if self.goal is None:
+            targets = self.get_target_images()
+            self.goal = self.get_neighbor(targets[0])
+            print(f'Goal ID: {self.goal}')
+            self.find_path()
+
+    def get_neighbor(self, img):
+        """ Find nearest neighbor """
+        q_VLAD = self.get_VLAD(img).reshape(1, -1)
+        _, index = self.tree.query(q_VLAD, 1)
+        return index[0][0]
+
+    def find_path(self):
+        """ Compute shortest path """
+        start_index = self.get_neighbor(self.fpv)
+        try:
+            self.path = nx.astar_path(self.G, start_index, self.goal, weight="weight")
+            self.current_step = 0
+        except nx.NetworkXNoPath:
+            print("No valid path found!")
+            self.path = []
+
+if __name__ == "__main__":
+    import vis_nav_game
+    vis_nav_game.play(the_player=AutonomousPlayer())
