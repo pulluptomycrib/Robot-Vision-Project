@@ -1,5 +1,7 @@
-# p2.py - SimpleNavPlayer with Goal ID
-# Provides basic navigation guidance using VLAD distance to a specific Goal ID
+# p2.py - SimpleNavPlayer with Goal ID and Visual Feedback
+# Provides navigation guidance using VLAD distance to a specific Goal ID
+# Displays the goal image and closest matching exploration image
+# Uses existing VLAD/SIFT database without recomputing
 
 import pygame
 import cv2
@@ -27,6 +29,7 @@ class SimpleNavPlayer(Player):
         self.vlad_database = None  # VLAD descriptors for exploration images
         self.goal_id = None  # Index of the closest exploration image to target.jpg
         self.goal_image = None  # The actual goal image (from exploration data)
+        self.goal_vlad = None  # Precomputed VLAD descriptor for the goal image
 
         # Exploration data folder
         self.save_dir = "data/images_subsample/"
@@ -41,27 +44,23 @@ class SimpleNavPlayer(Player):
             raise FileNotFoundError(f"No exploration images found in {self.save_dir}.")
         print(f"Found {len(self.exploration_images)} exploration images in {self.save_dir}.")
 
-        # Load or compute SIFT codebook
-        if os.path.exists("sift_descriptors.npy"):
-            self.sift_descriptors = np.load("sift_descriptors.npy")
-        else:
-            self.sift_descriptors = self.compute_sift_descriptors()
-            np.save("sift_descriptors.npy", self.sift_descriptors)
+        # Load existing SIFT descriptors
+        if not os.path.exists("sift_descriptors.npy"):
+            raise FileNotFoundError("sift_descriptors.npy not found. Please ensure it exists from a previous run.")
+        self.sift_descriptors = np.load("sift_descriptors.npy")
+        print("Loaded existing SIFT descriptors.")
 
-        if os.path.exists("codebook.pkl"):
-            self.codebook = pickle.load(open("codebook.pkl", "rb"))
-        else:
-            print("Computing codebook...")
-            self.codebook = KMeans(n_clusters=128, init='k-means++', n_init=5, verbose=1).fit(self.sift_descriptors)
-            pickle.dump(self.codebook, open("codebook.pkl", "wb"))
+        # Load existing codebook
+        if not os.path.exists("codebook.pkl"):
+            raise FileNotFoundError("codebook.pkl not found. Please ensure it exists from a previous run.")
+        self.codebook = pickle.load(open("codebook.pkl", "rb"))
+        print("Loaded existing codebook.")
 
-        # Load or compute VLAD database
-        if os.path.exists("vlad_database.pkl"):
-            self.vlad_database = pickle.load(open("vlad_database.pkl", "rb"))
-        else:
-            self.vlad_database = self.compute_vlad_database()
-            with open("vlad_database.pkl", "wb") as f:
-                pickle.dump(self.vlad_database, f)
+        # Load existing VLAD database
+        if not os.path.exists("vlad_database.pkl"):
+            raise FileNotFoundError("vlad_database.pkl not found. Please ensure it exists from a previous run.")
+        self.vlad_database = pickle.load(open("vlad_database.pkl", "rb"))
+        print("Loaded existing VLAD database.")
 
         # Load target.jpg and set the Goal ID
         target_image = cv2.imread("target.jpg")
@@ -75,40 +74,6 @@ class SimpleNavPlayer(Player):
         # Track navigation state
         self.action_sequence = [Action.FORWARD, Action.LEFT, Action.RIGHT, Action.BACKWARD]
         self.action_index = 0  # Index to cycle through actions
-
-    def compute_sift_descriptors(self):
-        """Compute SIFT descriptors for all exploration images."""
-        print("Computing SIFT features...")
-        sift_descriptors = []
-        for img in tqdm(self.exploration_images, desc="Processing images for SIFT"):
-            img_path = os.path.join(self.save_dir, img)
-            img_data = cv2.imread(img_path)
-            if img_data is None:
-                print(f"Failed to load image for SIFT: {img_path}")
-                continue
-            _, des = self.sift.detectAndCompute(img_data, None)
-            if des is not None:
-                des = np.sqrt(des / np.linalg.norm(des, axis=1, keepdims=True))
-                sift_descriptors.extend(des)
-        if not sift_descriptors:
-            raise ValueError("No SIFT descriptors computed. Check if images are accessible.")
-        return np.asarray(sift_descriptors)
-
-    def compute_vlad_database(self):
-        """Compute VLAD descriptors for all exploration images."""
-        print("Computing VLAD database...")
-        vlad_database = []
-        for img in tqdm(self.exploration_images, desc="Processing images for VLAD"):
-            img_path = os.path.join(self.save_dir, img)
-            img_data = cv2.imread(img_path)
-            if img_data is None:
-                print(f"Failed to load image for VLAD: {img_path}")
-                continue
-            vlad = self.get_VLAD(img_data)
-            vlad_database.append(vlad)
-        if not vlad_database:
-            raise ValueError("No VLAD descriptors computed for database. Check if images are accessible.")
-        return vlad_database
 
     def set_goal_id(self, target_image):
         """Set the Goal ID by finding the closest exploration image to target.jpg."""
@@ -130,6 +95,8 @@ class SimpleNavPlayer(Player):
         self.goal_image = cv2.imread(os.path.join(self.save_dir, self.exploration_images[goal_id]))
         if self.goal_image is None:
             raise ValueError(f"Failed to load goal image: {self.exploration_images[goal_id]}")
+        # Use the precomputed VLAD descriptor from the database
+        self.goal_vlad = self.vlad_database[goal_id]
         print(f"Goal ID set to: {self.goal_id} (image: {self.exploration_images[goal_id]})")
 
     def reset(self):
@@ -187,24 +154,74 @@ class SimpleNavPlayer(Player):
         VLAD_feature = VLAD_feature / np.linalg.norm(VLAD_feature)
         return VLAD_feature
 
+    def find_closest_exploration_image(self, vlad_descriptor):
+        """Find the exploration image closest to the given VLAD descriptor."""
+        min_dist = float('inf')
+        closest_idx = None
+
+        for idx, vlad in enumerate(self.vlad_database):
+            dist = np.linalg.norm(vlad_descriptor - vlad)
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = idx
+
+        if closest_idx is None:
+            return None, None
+
+        closest_image = cv2.imread(os.path.join(self.save_dir, self.exploration_images[closest_idx]))
+        return closest_idx, closest_image
+
     def navigate_to_goal(self):
-        """Estimate proximity to goal and suggest an action."""
+        """Estimate proximity to goal, suggest an action, and display images."""
         if self.fpv is None:
             print("[Navigate] No FPV available.")
             return Action.IDLE
 
-        if self.goal_id is None or self.goal_image is None:
-            print("[Navigate] Goal ID or goal image not set.")
+        if self.goal_id is None or self.goal_image is None or self.goal_vlad is None:
+            print("[Navigate] Goal ID, goal image, or goal VLAD not set.")
             return Action.IDLE
 
-        # Compute VLAD distance to the goal image (the exploration image at Goal ID)
-        goal_vlad = self.get_VLAD(self.goal_image)
+        # Compute VLAD distance to the goal image using precomputed goal_vlad
         current_vlad = self.get_VLAD(self.fpv)
-        vlad_dist = np.linalg.norm(goal_vlad - current_vlad)
+        vlad_dist = np.linalg.norm(current_vlad - self.goal_vlad)
         print(f"[Navigate] VLAD distance to Goal ID {self.goal_id}: {vlad_dist:.4f} (lower is closer)")
 
-        # Since we can't simulate the new FPV after an action, cycle through actions
-        # and let the user monitor the VLAD distance
+        # Find the closest exploration image to the current FPV
+        closest_idx, closest_image = self.find_closest_exploration_image(current_vlad)
+        if closest_idx is not None:
+            print(f"[Navigate] Closest exploration image to current view: {self.exploration_images[closest_idx]} (index: {closest_idx})")
+
+        # Display the goal image and the closest matching exploration image
+        if self.screen is not None:
+            # Resize images to fit the screen
+            h, w, _ = self.fpv.shape
+            goal_display = cv2.resize(self.goal_image, (w // 3, h // 3))
+            closest_display = closest_image if closest_image is not None else np.zeros_like(goal_display)
+
+            # Convert to Pygame surfaces
+            def convert_opencv_img_to_pygame(opencv_image):
+                opencv_image = opencv_image[:, :, ::-1]  # BGR->RGB
+                shape = opencv_image.shape[1::-1]
+                pygame_image = pygame.image.frombuffer(opencv_image.tobytes(), shape, 'RGB')
+                return pygame_image
+
+            # Create a new surface for the combined display
+            combined_surface = pygame.Surface((w, h))
+            combined_surface.blit(convert_opencv_img_to_pygame(self.fpv), (0, 0))
+            combined_surface.blit(convert_opencv_img_to_pygame(goal_display), (0, 0))
+            combined_surface.blit(convert_opencv_img_to_pygame(closest_display), (w - w // 3, 0))
+
+            # Add labels
+            font = pygame.font.Font(None, 36)
+            goal_label = font.render("Goal", True, (255, 255, 255))
+            closest_label = font.render("Closest Match", True, (255, 255, 255))
+            combined_surface.blit(goal_label, (10, 10))
+            combined_surface.blit(closest_label, (w - w // 3 + 10, 10))
+
+            self.screen.blit(combined_surface, (0, 0))
+            pygame.display.update()
+
+        # Suggest an action by cycling through the sequence
         action = self.action_sequence[self.action_index]
         action_desc = {
             Action.FORWARD: "Move FORWARD (W or Up arrow)",
@@ -230,6 +247,8 @@ class SimpleNavPlayer(Player):
             h, w, _ = fpv.shape
             self.screen = pygame.display.set_mode((w, h))
 
+        # Display will be handled in navigate_to_goal when Q is pressed
+        # For now, just update the FPV
         def convert_opencv_img_to_pygame(opencv_image):
             opencv_image = opencv_image[:, :, ::-1]  # BGR->RGB
             shape = opencv_image.shape[1::-1]
@@ -237,10 +256,13 @@ class SimpleNavPlayer(Player):
             return pygame_image
 
         pygame.display.set_caption("SimpleNavPlayer:fpv")
-        rgb = convert_opencv_img_to_pygame(fpv)
-        self.screen.blit(rgb, (0, 0))
+        self.screen.blit(convert_opencv_img_to_pygame(fpv), (0, 0))
         pygame.display.update()
 
 if __name__ == "__main__":
     import vis_nav_game
-    vis_nav_game.play(the_player=SimpleNavPlayer())
+    try:
+        vis_nav_game.play(the_player=SimpleNavPlayer())
+    except Exception as e:
+        print(f"Error during game execution: {e}")
+        print("This may be due to an NTP timeout. Ensure you have internet access or check if vis_nav_game can be configured to skip NTP synchronization.")
