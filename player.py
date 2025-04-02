@@ -1,5 +1,5 @@
-# p2.py - SimpleNavPlayer
-# Provides basic navigation guidance using VLAD distance (tries to)
+# p2.py - SimpleNavPlayer with Goal ID
+# Provides basic navigation guidance using VLAD distance to a specific Goal ID
 
 import pygame
 import cv2
@@ -24,6 +24,9 @@ class SimpleNavPlayer(Player):
         # SIFT / VLAD for visual similarity
         self.sift = cv2.SIFT_create()
         self.codebook = None
+        self.vlad_database = None  # VLAD descriptors for exploration images
+        self.goal_id = None  # Index of the closest exploration image to target.jpg
+        self.goal_image = None  # The actual goal image (from exploration data)
 
         # Exploration data folder
         self.save_dir = "data/images_subsample/"
@@ -52,11 +55,22 @@ class SimpleNavPlayer(Player):
             self.codebook = KMeans(n_clusters=128, init='k-means++', n_init=5, verbose=1).fit(self.sift_descriptors)
             pickle.dump(self.codebook, open("codebook.pkl", "wb"))
 
-        # Goal image
-        self.goal_image = cv2.imread("target.jpg")
-        if self.goal_image is None:
+        # Load or compute VLAD database
+        if os.path.exists("vlad_database.pkl"):
+            self.vlad_database = pickle.load(open("vlad_database.pkl", "rb"))
+        else:
+            self.vlad_database = self.compute_vlad_database()
+            with open("vlad_database.pkl", "wb") as f:
+                pickle.dump(self.vlad_database, f)
+
+        # Load target.jpg and set the Goal ID
+        target_image = cv2.imread("target.jpg")
+        if target_image is None:
             print("Failed to load target.jpg. Please ensure it exists in the project directory.")
             raise FileNotFoundError("target.jpg not found.")
+
+        # Set the Goal ID by finding the closest exploration image to target.jpg
+        self.set_goal_id(target_image)
 
         # Track navigation state
         self.action_sequence = [Action.FORWARD, Action.LEFT, Action.RIGHT, Action.BACKWARD]
@@ -79,6 +93,44 @@ class SimpleNavPlayer(Player):
         if not sift_descriptors:
             raise ValueError("No SIFT descriptors computed. Check if images are accessible.")
         return np.asarray(sift_descriptors)
+
+    def compute_vlad_database(self):
+        """Compute VLAD descriptors for all exploration images."""
+        print("Computing VLAD database...")
+        vlad_database = []
+        for img in tqdm(self.exploration_images, desc="Processing images for VLAD"):
+            img_path = os.path.join(self.save_dir, img)
+            img_data = cv2.imread(img_path)
+            if img_data is None:
+                print(f"Failed to load image for VLAD: {img_path}")
+                continue
+            vlad = self.get_VLAD(img_data)
+            vlad_database.append(vlad)
+        if not vlad_database:
+            raise ValueError("No VLAD descriptors computed for database. Check if images are accessible.")
+        return vlad_database
+
+    def set_goal_id(self, target_image):
+        """Set the Goal ID by finding the closest exploration image to target.jpg."""
+        print("Setting Goal ID...")
+        target_vlad = self.get_VLAD(target_image)
+        min_dist = float('inf')
+        goal_id = None
+
+        for idx, vlad in enumerate(self.vlad_database):
+            dist = np.linalg.norm(target_vlad - vlad)
+            if dist < min_dist:
+                min_dist = dist
+                goal_id = idx
+
+        if goal_id is None:
+            raise ValueError("Could not set Goal ID. VLAD database may be empty.")
+
+        self.goal_id = goal_id
+        self.goal_image = cv2.imread(os.path.join(self.save_dir, self.exploration_images[goal_id]))
+        if self.goal_image is None:
+            raise ValueError(f"Failed to load goal image: {self.exploration_images[goal_id]}")
+        print(f"Goal ID set to: {self.goal_id} (image: {self.exploration_images[goal_id]})")
 
     def reset(self):
         self.fpv = None
@@ -141,11 +193,15 @@ class SimpleNavPlayer(Player):
             print("[Navigate] No FPV available.")
             return Action.IDLE
 
-        # Compute VLAD distance to the goal
+        if self.goal_id is None or self.goal_image is None:
+            print("[Navigate] Goal ID or goal image not set.")
+            return Action.IDLE
+
+        # Compute VLAD distance to the goal image (the exploration image at Goal ID)
         goal_vlad = self.get_VLAD(self.goal_image)
         current_vlad = self.get_VLAD(self.fpv)
         vlad_dist = np.linalg.norm(goal_vlad - current_vlad)
-        print(f"[Navigate] VLAD distance to goal: {vlad_dist:.4f} (lower is closer)")
+        print(f"[Navigate] VLAD distance to Goal ID {self.goal_id}: {vlad_dist:.4f} (lower is closer)")
 
         # Since we can't simulate the new FPV after an action, cycle through actions
         # and let the user monitor the VLAD distance
